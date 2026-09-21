@@ -1,0 +1,186 @@
+name: Sync MassFarming to Hexium
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: massfarming-hexium-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout mirror repository
+        uses: actions/checkout@v4
+
+      - name: Detect latest official MassFarming release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.request
+          from pathlib import Path
+
+          api = "https://api.github.com/repos/Xeio/MassFarming/releases/latest"
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "User-Agent": "dav1dera-massfarming-hexium-sync",
+          }
+          token = os.environ.get("GH_TOKEN", "").strip()
+          if token:
+              headers["Authorization"] = f"Bearer {token}"
+
+          request = urllib.request.Request(api, headers=headers)
+          with urllib.request.urlopen(request, timeout=60) as response:
+              release = json.load(response)
+
+          if release.get("draft") or release.get("prerelease"):
+              raise SystemExit("GitHub releases/latest unexpectedly returned a draft/prerelease")
+
+          tag = str(release["tag_name"]).strip()
+          version = tag[1:] if tag.lower().startswith("v") else tag
+
+          match = re.fullmatch(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", version)
+          if not match:
+              raise SystemExit(f"Unsupported upstream version format: {tag}")
+
+          major = int(match.group(1))
+          minor = int(match.group(2) or 0)
+          patch = int(match.group(3) or 0)
+          package_version = f"{major}.{minor}.{patch}"
+
+          assets = [
+              item for item in release.get("assets", [])
+              if item.get("name") == "MassFarming.zip"
+          ]
+          if len(assets) != 1:
+              raise SystemExit(
+                  f"Expected exactly one MassFarming.zip release asset, found {len(assets)}"
+              )
+
+          asset = assets[0]
+          values = {
+              "tag": tag,
+              "version": version,
+              "package_version": package_version,
+              "release_id": str(release["id"]),
+              "asset_name": str(asset["name"]),
+              "asset_url": str(asset["browser_download_url"]),
+              "asset_digest": str(asset.get("digest") or ""),
+          }
+
+          output = Path(os.environ["GITHUB_OUTPUT"])
+          with output.open("a", encoding="utf-8") as fh:
+              for key, value in values.items():
+                  if "\n" in value or "\r" in value:
+                      raise SystemExit(f"Unexpected newline in release metadata: {key}")
+                  fh.write(f"{key}={value}\n")
+
+          print(f"Upstream tag:     {tag}")
+          print(f"Upstream version: {version}")
+          print(f"Hexium version:   {package_version}")
+          print(f"Release ID:       {release['id']}")
+          print(f"Asset:            {asset['name']}")
+          print(f"Digest:           {asset.get('digest') or 'not provided'}")
+          PY
+
+      - name: Download and verify official upstream files
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ steps.release.outputs.tag }}
+          UPSTREAM_ASSET_URL: ${{ steps.release.outputs.asset_url }}
+          UPSTREAM_ASSET_DIGEST: ${{ steps.release.outputs.asset_digest }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist/upstream
+          curl --fail --location --retry 3 --retry-delay 2             "$UPSTREAM_ASSET_URL"             --output dist/upstream/MassFarming.zip
+
+          test -s dist/upstream/MassFarming.zip
+
+          if [[ -n "$UPSTREAM_ASSET_DIGEST" ]]; then
+            case "$UPSTREAM_ASSET_DIGEST" in
+              sha256:*)
+                EXPECTED="${UPSTREAM_ASSET_DIGEST#sha256:}"
+                echo "$EXPECTED  dist/upstream/MassFarming.zip" | sha256sum --check --strict -
+                ;;
+              *)
+                echo "::warning::GitHub supplied an unsupported digest format: $UPSTREAM_ASSET_DIGEST"
+                ;;
+            esac
+          else
+            echo "::warning::GitHub did not provide a release-asset digest"
+          fi
+
+          curl --fail --location --retry 3 --retry-delay 2             "https://raw.githubusercontent.com/Xeio/MassFarming/$UPSTREAM_TAG/LICENSE"             --output dist/upstream/LICENSE
+
+          test -s dist/upstream/LICENSE
+
+          echo "Official release ZIP:"
+          unzip -l dist/upstream/MassFarming.zip
+
+      - name: Package for Hexium
+        id: package
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ steps.release.outputs.tag }}
+          UPSTREAM_VERSION: ${{ steps.release.outputs.version }}
+          PACKAGE_VERSION: ${{ steps.release.outputs.package_version }}
+          UPSTREAM_RELEASE_ID: ${{ steps.release.outputs.release_id }}
+          UPSTREAM_ASSET_NAME: ${{ steps.release.outputs.asset_name }}
+          UPSTREAM_ASSET_DIGEST: ${{ steps.release.outputs.asset_digest }}
+        run: |
+          set -euo pipefail
+          python3 scripts/package-massfarming-hexium.py
+
+          ZIP="dist/hexium/MassFarming_Xeio-${PACKAGE_VERSION}-hexium.zip"
+          test -s "$ZIP"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+
+          echo
+          echo "Package SHA-256:"
+          sha256sum "$ZIP"
+
+          echo
+          echo "Package contents:"
+          unzip -l "$ZIP"
+
+      - name: Upload generated package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MassFarming_Xeio-${{ steps.release.outputs.package_version }}-hexium
+          path: ${{ steps.package.outputs.zip }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish to Hexium
+        shell: bash
+        env:
+          HEXIUM_TOKEN: ${{ secrets.HEXIUM_TOKEN }}
+          HEXIUM_TEAM: Sgorbi
+          HEXIUM_PACKAGE: MassFarming_Xeio
+          HEXIUM_COMMUNITY: valheim
+          HEXIUM_CATEGORIES: Valheim 1.0
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$HEXIUM_TOKEN" ]]; then
+            echo "::warning::HEXIUM_TOKEN is not configured; package was built but Hexium publishing was skipped."
+            exit 0
+          fi
+
+          python3 scripts/publish-massfarming-hexium.py
